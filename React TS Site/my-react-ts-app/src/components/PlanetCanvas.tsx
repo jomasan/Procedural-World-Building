@@ -1,8 +1,8 @@
 import React, { useRef, useEffect } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
-import { PlanetSettings, TerrainSettings, NoiseLayer } from '../types/planet';
-import { sampleNoise } from '../utils/noise';
+import { PlanetSettings, TerrainSettings, ShaderSettings } from '../types/planet';
+import { stackElevation, effectiveLayers } from '../utils/terrain';
 import './PlanetCanvas.css';
 
 const MAX_STOPS = 5;
@@ -18,10 +18,22 @@ uniform int   uRampMode;        // 1 = gradient, 2 = stepped
 uniform int   uRampCount;
 uniform vec3  uRampColors[${MAX_STOPS}];
 uniform float uRampPositions[${MAX_STOPS}];
+uniform int   uSeaLink;         // 1 = anchor ramp to the water height
+uniform float uSeaLevel;        // water elevation above the base sphere
 
 vec3 terrainRamp() {
-  float range = max(uElevMax - uElevMin, 1e-4);
-  float t = clamp((vElev - uElevMin) / range, 0.0, 1.0);
+  float t;
+  if (uSeaLink == 1) {
+    // Ramp position 0.5 sits exactly at the waterline: stops below 0.5 shade
+    // underwater terrain, stops above 0.5 shade land. Moving the sea level
+    // re-anchors the coloring automatically.
+    t = vElev < uSeaLevel
+      ? 0.5 * clamp((vElev - uElevMin) / max(uSeaLevel - uElevMin, 1e-4), 0.0, 1.0)
+      : 0.5 + 0.5 * clamp((vElev - uSeaLevel) / max(uElevMax - uSeaLevel, 1e-4), 0.0, 1.0);
+  } else {
+    float range = max(uElevMax - uElevMin, 1e-4);
+    t = clamp((vElev - uElevMin) / range, 0.0, 1.0);
+  }
   vec3 col = uRampColors[0];
   for (int i = 1; i < ${MAX_STOPS}; i++) {
     if (i >= uRampCount) break;
@@ -198,27 +210,31 @@ function rampToUniforms(settings: PlanetSettings, elevMin: number, elevMax: numb
     uRampCount:     { value: sorted.length },
     uRampColors:    { value: colors },
     uRampPositions: { value: positions },
+    uSeaLink:       { value: settings.shaders.linkToSea ? 1 : 0 },
+    uSeaLevel:      { value: settings.ocean.seaLevel },
   };
 }
 
 function createTerrainMaterial(
   settings: PlanetSettings, elevMin: number, elevMax: number
 ): THREE.Material {
-  const { style, colorMode, terrainColor } = settings.shaders;
+  const { style, colorMode, terrainColor, ao } = settings.shaders;
 
+  // AO is baked into a vertex color attribute; vertexColors multiplies it in
+  // for every material path (lit or unlit, solid or ramp).
   // Solid: plain material, no shader injection.
   if (colorMode === 'solid') {
     const c = new THREE.Color(terrainColor);
     return style === 'standard-lit'
-      ? new THREE.MeshPhongMaterial({ color: c, shininess: 20, specular: new THREE.Color(0x224422) })
-      : new THREE.MeshBasicMaterial({ color: c });
+      ? new THREE.MeshPhongMaterial({ color: c, shininess: 20, specular: new THREE.Color(0x224422), vertexColors: ao })
+      : new THREE.MeshBasicMaterial({ color: c, vertexColors: ao });
   }
 
   // Gradient / stepped: keep the standard material's lighting (or flat unlit)
   // and override the diffuse color with an elevation ramp via onBeforeCompile.
   const mat: THREE.Material = style === 'standard-lit'
-    ? new THREE.MeshPhongMaterial({ color: 0xffffff, shininess: 20, specular: new THREE.Color(0x224422) })
-    : new THREE.MeshBasicMaterial({ color: 0xffffff });
+    ? new THREE.MeshPhongMaterial({ color: 0xffffff, shininess: 20, specular: new THREE.Color(0x224422), vertexColors: ao })
+    : new THREE.MeshBasicMaterial({ color: 0xffffff, vertexColors: ao });
 
   const elevUniforms = rampToUniforms(settings, elevMin, elevMax);
   mat.userData.elevUniforms = elevUniforms;
@@ -230,11 +246,13 @@ function createTerrainMaterial(
         '#include <begin_vertex>',
         '#include <begin_vertex>\n  vElev = length(position) - uRadius;'
       );
+    // Set the ramp color *before* <color_fragment> so the AO vertex-color
+    // multiply (inside that include) applies on top of it.
     shader.fragmentShader =
       TERRAIN_RAMP_GLSL +
       shader.fragmentShader.replace(
         '#include <color_fragment>',
-        '#include <color_fragment>\n  diffuseColor.rgb = terrainRamp();'
+        'diffuseColor.rgb = terrainRamp();\n#include <color_fragment>'
       );
   };
   return mat;
@@ -271,41 +289,77 @@ function createOceanMaterial(settings: PlanetSettings): THREE.ShaderMaterial {
   });
 }
 
-function applyLayer(nx: number, ny: number, nz: number, layer: NoiseLayer): number {
-  return sampleNoise(
-    nx * layer.scale, ny * layer.scale, nz * layer.scale,
-    layer.noiseType, layer.octaves, layer.persistence, layer.lacunarity
-  );
-}
-
 interface BuiltGeometry {
   geometry: THREE.BufferGeometry;
   elevMin: number;   // min radial displacement (matches length(pos) - radius in shader)
   elevMax: number;
 }
 
+// Crevice AO baked into a vertex color attribute: a vertex sitting lower than
+// its neighbours (sampled `radius` grid cells away, 8 directions) is occluded.
+// Self-normalizing against the mean occlusion so it stays visible at any
+// elevation scale or resolution; `contrast` is a gamma on that distribution.
+// ponytail: swap for a screen-space SSAOPass if baked AO ever looks too coarse.
+function bakeVertexAO(
+  geo: THREE.BufferGeometry, elevs: Float32Array, resolution: number,
+  strength: number, radius: number, contrast: number
+): void {
+  const cols = resolution + 1;
+  const rows = elevs.length / cols;
+  const period = cols - 1;                       // seam column is duplicated
+  const r = Math.max(1, Math.round(radius));
+  const wrapX = (ix: number) => ((ix % period) + period) % period;
+  const clampY = (iy: number) => Math.max(0, Math.min(rows - 1, iy));
+  const occ = new Float32Array(elevs.length);
+  let sum = 0;
+  for (let iy = 0; iy < rows; iy++) {
+    for (let ix = 0; ix < cols; ix++) {
+      const i = iy * cols + ix;
+      let n = 0;
+      for (const [dx, dy] of [[-r, 0], [r, 0], [0, -r], [0, r], [-r, -r], [r, -r], [-r, r], [r, r]]) {
+        n += elevs[clampY(iy + dy) * cols + wrapX(ix + dx)];
+      }
+      const o = Math.max(0, n / 8 - elevs[i]);
+      occ[i] = o;
+      sum += o;
+    }
+  }
+  const k = 3 * (sum / elevs.length) + 1e-9;
+  const colors = new Float32Array(elevs.length * 3);
+  for (let i = 0; i < elevs.length; i++) {
+    const a = 1 - strength * Math.pow(Math.min(occ[i] / k, 1), contrast);
+    colors[i * 3] = colors[i * 3 + 1] = colors[i * 3 + 2] = a;
+  }
+  geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+}
+
 function buildPlanetGeometry(
-  radius: number, resolution: number, terrain: TerrainSettings
+  radius: number, resolution: number, terrain: TerrainSettings, shaders: ShaderSettings
 ): BuiltGeometry {
   const geo = new THREE.SphereGeometry(radius, resolution, resolution);
-  if (!terrain.enabled) return { geometry: geo, elevMin: 0, elevMax: 0 };
   const pos = geo.attributes.position as THREE.BufferAttribute;
+  if (!terrain.enabled) {
+    // Materials with vertexColors need the attribute even on a smooth sphere
+    if (shaders.ao) geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(pos.count * 3).fill(1), 3));
+    return { geometry: geo, elevMin: 0, elevMax: 0 };
+  }
+  const layers = effectiveLayers(terrain);
+  const elevs = new Float32Array(pos.count);
   let elevMin = Infinity, elevMax = -Infinity;
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
     const r = Math.sqrt(x * x + y * y + z * z);
     if (r === 0) continue;
     const nx = x / r, ny = y / r, nz = z / r;
-    const elev =
-      (terrain.macro.strength * applyLayer(nx, ny, nz, terrain.macro) +
-       terrain.micro.strength * applyLayer(nx, ny, nz, terrain.micro)) *
-      terrain.elevationScale;
+    const elev = stackElevation(layers, nx, ny, nz) * terrain.elevationScale;
+    elevs[i] = elev;
     if (elev < elevMin) elevMin = elev;
     if (elev > elevMax) elevMax = elev;
     pos.setXYZ(i, x + nx * elev, y + ny * elev, z + nz * elev);
   }
   pos.needsUpdate = true;
   geo.computeVertexNormals();
+  if (shaders.ao) bakeVertexAO(geo, elevs, resolution, shaders.aoStrength, shaders.aoRadius, shaders.aoContrast);
   return { geometry: geo, elevMin, elevMax };
 }
 
@@ -319,6 +373,7 @@ interface SceneRefs {
   camera:      THREE.PerspectiveCamera;
   controls:    OrbitControls;
   planet:      THREE.Mesh;
+  wire:        THREE.Mesh;   // wireframe overlay, shares the planet's geometry
   ocean:       THREE.Mesh;
   depthTarget: THREE.WebGLRenderTarget;
   animId:      number;
@@ -360,10 +415,20 @@ const PlanetCanvas: React.FC<Props> = ({ settings }) => {
     controls.maxDistance = 10;
 
     // Planet
-    const built = buildPlanetGeometry(settings.shape.radius, settings.shape.resolution, settings.terrain);
+    const built = buildPlanetGeometry(settings.shape.radius, settings.shape.resolution, settings.terrain, settings.shaders);
     const planetMat = createTerrainMaterial(settings, built.elevMin, built.elevMax);
     const planet = new THREE.Mesh(built.geometry, planetMat);
     scene.add(planet);
+
+    // Wireframe overlay — same geometry, scaled a hair outward so lines sit
+    // on top of the shading; depthWrite off keeps it out of the ocean's
+    // coastline depth pre-pass.
+    const wire = new THREE.Mesh(built.geometry, new THREE.MeshBasicMaterial({
+      color: 0x6666cc, wireframe: true, transparent: true, opacity: 0.35, depthWrite: false,
+    }));
+    wire.scale.setScalar(1.001);
+    wire.visible = settings.shape.wireframe;
+    scene.add(wire);
 
     // Depth target + ocean — sized to physical pixels so gl_FragCoord.xy / uResolution is correct
     const depthTarget = createDepthTarget(PW, PH);
@@ -417,7 +482,7 @@ const PlanetCanvas: React.FC<Props> = ({ settings }) => {
     };
 
     sceneRef.current = {
-      renderer, scene, camera, controls, planet, ocean, depthTarget,
+      renderer, scene, camera, controls, planet, wire, ocean, depthTarget,
       animId: 0, startTime, elevMin: built.elevMin, elevMax: built.elevMax,
     };
     animate();
@@ -426,6 +491,7 @@ const PlanetCanvas: React.FC<Props> = ({ settings }) => {
       if (!sceneRef.current) return;
       const refs = sceneRef.current;
       const w = mount.clientWidth, h = mount.clientHeight;
+      if (w === 0 || h === 0) return; // hidden behind the 2D map tab
       refs.camera.aspect = w / h;
       refs.camera.updateProjectionMatrix();
       refs.renderer.setSize(w, h);
@@ -443,7 +509,8 @@ const PlanetCanvas: React.FC<Props> = ({ settings }) => {
       if (sceneRef.current) {
         const refs = sceneRef.current;
         (refs.planet.material as THREE.Material).dispose();
-        refs.planet.geometry.dispose();
+        (refs.wire.material as THREE.Material).dispose();
+        refs.planet.geometry.dispose();   // shared with wire — dispose once
         (refs.ocean.material as THREE.Material).dispose();
         refs.ocean.geometry.dispose();
         refs.depthTarget.depthTexture?.dispose();
@@ -461,8 +528,9 @@ const PlanetCanvas: React.FC<Props> = ({ settings }) => {
     const refs = sceneRef.current;
     if (!refs) return;
     const old = refs.planet.geometry;
-    const built = buildPlanetGeometry(settings.shape.radius, settings.shape.resolution, settings.terrain);
+    const built = buildPlanetGeometry(settings.shape.radius, settings.shape.resolution, settings.terrain, settings.shaders);
     refs.planet.geometry = built.geometry;
+    refs.wire.geometry = built.geometry;
     refs.elevMin = built.elevMin;
     refs.elevMax = built.elevMax;
     // Push the new elevation range to the ramp shader (if active).
@@ -473,7 +541,14 @@ const PlanetCanvas: React.FC<Props> = ({ settings }) => {
       eu.uRadius.value  = settings.shape.radius;
     }
     old.dispose();
-  }, [settings.shape.radius, settings.shape.resolution, settings.terrain]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.shape.radius, settings.shape.resolution, settings.terrain,
+      settings.shaders.ao, settings.shaders.aoStrength, settings.shaders.aoRadius, settings.shaders.aoContrast]);
+
+  // ── Wireframe overlay visibility ─────────────────────────────────────────
+  useEffect(() => {
+    if (sceneRef.current) sceneRef.current.wire.visible = settings.shape.wireframe;
+  }, [settings.shape.wireframe]);
 
   // ── Terrain material — recreate only on structural changes (lit/flat,
   //    or crossing the solid ↔ ramp boundary) to avoid GLSL recompiles on drag.
@@ -485,7 +560,7 @@ const PlanetCanvas: React.FC<Props> = ({ settings }) => {
     refs.planet.material = createTerrainMaterial(settings, refs.elevMin, refs.elevMax);
     old.dispose();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings.shaders.style, isRampMode]);
+  }, [settings.shaders.style, isRampMode, settings.shaders.ao]);
 
   // ── Solid terrain color ──────────────────────────────────────────────────
   useEffect(() => {
@@ -508,8 +583,10 @@ const PlanetCanvas: React.FC<Props> = ({ settings }) => {
     eu.uRampCount.value     = fresh.uRampCount.value;
     eu.uRampColors.value    = fresh.uRampColors.value;
     eu.uRampPositions.value = fresh.uRampPositions.value;
+    eu.uSeaLink.value       = fresh.uSeaLink.value;
+    eu.uSeaLevel.value      = fresh.uSeaLevel.value;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings.shaders.ramp, settings.shaders.colorMode]);
+  }, [settings.shaders.ramp, settings.shaders.colorMode, settings.shaders.linkToSea, settings.ocean.seaLevel]);
 
   // ── Ocean geometry + visibility ──────────────────────────────────────────
   useEffect(() => {

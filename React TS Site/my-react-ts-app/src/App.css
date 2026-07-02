@@ -34,6 +34,34 @@
   letter-spacing: 0.5px;
 }
 
+/* ── View tabs (3D / 2D map) ── */
+.view-tabs {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+
+.view-tab {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  color: #8888aa;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+.view-tab:hover {
+  color: #aaaadd;
+}
+
+.view-tab.active {
+  color: #ccccff;
+  background: #1c1c2e;
+  border-color: #2a2a44;
+}
+
 /* ── Three.js viewport ── */
 .canvas-viewport {
   flex: 1;

@@ -291,6 +291,17 @@
   cursor: default;
 }
 
+.ctrl-number {
+  width: 80px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 10px;
+  color: #ccccdd;
+  background: #181828;
+  border: 1px solid #2a2a44;
+  border-radius: 2px;
+  padding: 2px 4px;
+}
+
 .ramp-add-btn {
   font-family: 'IBM Plex Mono', monospace;
   font-size: 8px;
