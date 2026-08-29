@@ -1,3 +1,8 @@
+Student tutorials live in [Tutorials/](Tutorials/00-overview.md). Start
+with [01 — The terminal](Tutorials/01-terminal-and-setup-checks.md), then
+[02 — Node.js, npm, and installing React](Tutorials/02-node-npm-and-react.md),
+then [03 — What React is, and why TypeScript](Tutorials/03-react-paradigm-and-typescript.md),
+then [04 — Three.js and the React UI](Tutorials/04-threejs-and-react-dialogue.md).
 
 Learning Path:
 -1 - website fundamentals - HTML, CSS, Javascript
